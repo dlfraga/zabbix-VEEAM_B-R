@@ -687,45 +687,20 @@ function ExportXml
 			# Get cached module path (performance optimization)
 			$moduleInfo = Get-VeeamModulePath
 			
-			Start-Job -Name $name -ScriptBlock {
-				# Suppress warnings and errors
-				$ErrorActionPreference = 'SilentlyContinue'
-				$WarningPreference = 'SilentlyContinue'
-				
-				# Load Veeam PowerShell module or snapin using cached path
-				$moduleLoaded = $false
-				if ($args[4].Type -eq "Module") {
-					if ($args[4].Path -eq "Veeam.Backup.PowerShell") {
-						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-					} else {
-						Import-Module $args[4].Path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-					}
-					if (Get-Module -Name Veeam.Backup.PowerShell) {
-						$moduleLoaded = $true
-					}
-				} else {
-					Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
-					$moduleLoaded = $true
-				}
-				
-				$connectVeeam = Connect-VBRServer
-				# Write directly to final location (performance optimization)
-				Invoke-Expression $args[0] | Export-Clixml $args[1]
-				$disconnectVeeam = Disconnect-VBRServer
-			} -ArgumentList "$command", "$newpath", "$name", "$newpath", $moduleInfo
-		}
-		
-		
-		if ($switch -like "byvm")
-		{
-			# For Veeam 13+, BackupSync jobs need to use Get-VBRBackupCopyJob instead of filtering Get-VBRJob
-			if ($type -eq "BackupSync") {
-				$commandnew = "Get-VBRBackupCopyJob"
-			} else {
-				$commandnew = "$command " + "| Where-Object { `$_.JobType -eq `"$type`" }"
+			# Phase 2 optimization: Replace Invoke-Expression with direct cmdlet calls
+			# Map command strings to script blocks for better performance
+			$cmdletMap = @{
+				"Get-VBRBackupSession" = { Get-VBRBackupSession }
+				"Get-VBRJob" = { Get-VBRJob }
+				"Get-VBRBackup" = { Get-VBRBackup }
+				"Get-VBRTapeJob" = { Get-VBRTapeJob }
+				"Get-VBREPJob" = { Get-VBREPJob }
 			}
-			# Get cached module path (performance optimization)
-			$moduleInfo = Get-VeeamModulePath
+			
+			$cmdletScriptBlock = $null
+			if ($cmdletMap.ContainsKey($command)) {
+				$cmdletScriptBlock = $cmdletMap[$command]
+			}
 			
 			Start-Job -Name $name -ScriptBlock {
 				# Suppress warnings and errors
@@ -749,14 +724,71 @@ function ExportXml
 				}
 				
 				$connectVeeam = Connect-VBRServer
-				$BackupVmByJob = Invoke-Expression $args[0] | ForEach-Object {
-					$JobName = $_.Name
-					$_ | Get-VBRJobObject | Where-Object { $_.Object.Type -eq "VM" } | Select-Object @{ L = "Job"; E = { $JobName } }, Name | Sort-Object -Property Job, Name
+				# Phase 3 optimization: Use direct script block execution (no fallback needed - all commands mapped)
+				& $args[5] | Export-Clixml $args[1]
+				$disconnectVeeam = Disconnect-VBRServer
+			} -ArgumentList "$command", "$newpath", "$name", "$newpath", $moduleInfo, $cmdletScriptBlock
+		}
+		
+		
+		if ($switch -like "byvm")
+		{
+			# Get cached module path (performance optimization)
+			$moduleInfo = Get-VeeamModulePath
+			
+			# Phase 2 optimization: Create optimized script blocks instead of string commands
+			if ($type -eq "BackupSync") {
+				# For Veeam 13+, use Get-VBRBackupCopyJob directly
+				$byvmScriptBlock = {
+					Get-VBRBackupCopyJob | ForEach-Object {
+						$JobName = $_.Name
+						$_ | Get-VBRJobObject | Where-Object { $_.Object.Type -eq "VM" } | Select-Object @{ L = "Job"; E = { $JobName } }, Name | Sort-Object -Property Job, Name
+					}
+				}
+			} else {
+				# For Backup type, filter Get-VBRJob
+				$byvmScriptBlock = {
+					Get-VBRJob | Where-Object { $_.JobType -eq $args[0] } | ForEach-Object {
+						$JobName = $_.Name
+						$_ | Get-VBRJobObject | Where-Object { $_.Object.Type -eq "VM" } | Select-Object @{ L = "Job"; E = { $JobName } }, Name | Sort-Object -Property Job, Name
+					}
+				}
+			}
+			
+			Start-Job -Name $name -ScriptBlock {
+				# Suppress warnings and errors
+				$ErrorActionPreference = 'SilentlyContinue'
+				$WarningPreference = 'SilentlyContinue'
+				
+				# Load Veeam PowerShell module or snapin using cached path
+				$moduleLoaded = $false
+				if ($args[4].Type -eq "Module") {
+					if ($args[4].Path -eq "Veeam.Backup.PowerShell") {
+						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+					} else {
+						Import-Module $args[4].Path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+					}
+					if (Get-Module -Name Veeam.Backup.PowerShell) {
+						$moduleLoaded = $true
+					}
+				} else {
+					Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+					$moduleLoaded = $true
+				}
+				
+				$connectVeeam = Connect-VBRServer
+				# Phase 2 optimization: Use script block instead of Invoke-Expression
+				if ($args[5]) {
+					# Use script block with type parameter if needed
+					$BackupVmByJob = & $args[5] $args[6]
+				} else {
+					# Fallback (should not happen)
+					$BackupVmByJob = @()
 				}
 				# Write directly to final location (performance optimization)
 				$BackupVmByJob | Export-Clixml $args[1]
 				$disconnectVeeam = Disconnect-VBRServer
-			} -ArgumentList "$commandnew", "$newpath", "$name", "$newpath", $moduleInfo
+			} -ArgumentList $null, "$newpath", "$name", "$newpath", $moduleInfo, $byvmScriptBlock, $type
 		}
 		
 		if ($switch -like "bytaskswithretry")
@@ -825,8 +857,8 @@ function ExportXml
 			} -ArgumentList "$commandnew", "$newpath", "$name", "$newpath", "$days", $moduleInfo
 		}
 		
-		# Purge completed Job 
-		$purge = get-job | Where-Object { $_.State -eq 'Completed' } | Remove-Job
+		# Phase 3 optimization: Efficient job cleanup - remove all completed/failed jobs in one operation
+		Get-Job | Where-Object { $_.State -eq 'Completed' -or $_.State -eq 'Failed' } | Remove-Job -ErrorAction SilentlyContinue
 	}
 }
 
@@ -1053,7 +1085,11 @@ switch ($ITEM)
 		$job4 = ExportXml -command Get-VBRJob -name backupvmbyjob -switch byvm -type Backup
 		$job5 = ExportXml -command Get-VBRJob -name backupsyncvmbyjob -switch byvm -type BackupSync
 		$job6 = ExportXml -name backuptaskswithretry -switch bytaskswithretry
-		Get-Job | Wait-Job
+		# Phase 3 optimization: Wait for jobs with timeout and efficient cleanup
+		$jobs = Get-Job
+		$jobs | Wait-Job -Timeout 600 | Out-Null
+		# Phase 3: Clean up all jobs (completed and failed) in single operation
+		Get-Job | Remove-Job -ErrorAction SilentlyContinue
 		
 	}
 	
