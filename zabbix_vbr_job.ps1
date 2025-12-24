@@ -567,56 +567,98 @@ function Test-VeeamHealth
 	}
 }
 
+# Cache for discovered Veeam module path (performance optimization)
+$script:VeeamModulePath = $null
+$script:VeeamModuleType = $null
+
+# Function to discover and cache Veeam PowerShell module path
+function Get-VeeamModulePath
+{
+	[CmdletBinding()]
+	Param()
+	
+	# Return cached path if already discovered
+	if ($script:VeeamModulePath) {
+		return @{
+			Path = $script:VeeamModulePath
+			Type = $script:VeeamModuleType
+		}
+	}
+	
+	# Try to import from standard module paths (Veeam 13+)
+	if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+		$script:VeeamModulePath = "Veeam.Backup.PowerShell"
+		$script:VeeamModuleType = "Module"
+		return @{
+			Path = $script:VeeamModulePath
+			Type = $script:VeeamModuleType
+		}
+	}
+	
+	# Try common installation paths
+	$possiblePaths = @(
+		"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
+		"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
+	)
+	
+	# Try to get from registry
+	try {
+		$installDir = (Get-ItemProperty -Path "HKLM:\Software\Veeam\Veeam Backup and Replication" -Name "InstallDir" -ErrorAction SilentlyContinue).InstallDir
+		if ($installDir) {
+			$modulePathFromReg = Join-Path $installDir "Backup\BackupClient\Veeam.Backup.PowerShell"
+			if (Test-Path $modulePathFromReg) {
+				$possiblePaths = @($modulePathFromReg) + $possiblePaths
+			}
+		}
+	} catch {}
+	
+	foreach ($path in $possiblePaths) {
+		if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
+			$script:VeeamModulePath = $path
+			$script:VeeamModuleType = "Module"
+			return @{
+				Path = $script:VeeamModulePath
+				Type = $script:VeeamModuleType
+			}
+		}
+	}
+	
+	# Fall back to snapin (Veeam 12 and earlier)
+	$script:VeeamModulePath = "VeeamPSSnapIn"
+	$script:VeeamModuleType = "Snapin"
+	return @{
+		Path = $script:VeeamModulePath
+		Type = $script:VeeamModuleType
+	}
+}
+
 # Function to load Veeam PowerShell module or snapin
 function Load-VeeamPowerShell
 {
 	[CmdletBinding()]
 	Param()
 	
+	$moduleInfo = Get-VeeamModulePath
 	$moduleLoaded = $false
 	
-	# Try to import from standard module paths (Veeam 13+)
-	if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
-		Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-		if (Get-Module -Name Veeam.Backup.PowerShell) {
-			$moduleLoaded = $true
-		}
-	}
-	
-	# If not loaded, try to find module in Veeam installation directory
-	if (-not $moduleLoaded) {
-		$modulePath = $null
-		# Try common installation paths
-		$possiblePaths = @(
-			"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
-			"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
-		)
-		
-		# Try to get from registry
-		try {
-			$installDir = (Get-ItemProperty -Path "HKLM:\Software\Veeam\Veeam Backup and Replication" -Name "InstallDir" -ErrorAction SilentlyContinue).InstallDir
-			if ($installDir) {
-				$modulePathFromReg = Join-Path $installDir "Backup\BackupClient\Veeam.Backup.PowerShell"
-				if (Test-Path $modulePathFromReg) {
-					$possiblePaths = @($modulePathFromReg) + $possiblePaths
-				}
+	if ($moduleInfo.Type -eq "Module") {
+		if ($moduleInfo.Path -eq "Veeam.Backup.PowerShell") {
+			# Standard module path
+			Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+			if (Get-Module -Name Veeam.Backup.PowerShell) {
+				$moduleLoaded = $true
 			}
-		} catch {}
-		
-		foreach ($path in $possiblePaths) {
-			if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
-				Import-Module $path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-				if (Get-Module -Name Veeam.Backup.PowerShell) {
-					$moduleLoaded = $true
-					break
-				}
+		} else {
+			# Direct path
+			Import-Module $moduleInfo.Path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+			if (Get-Module -Name Veeam.Backup.PowerShell) {
+				$moduleLoaded = $true
 			}
 		}
-	}
-	
-	# Fall back to snapin (Veeam 12 and earlier)
-	if (-not $moduleLoaded) {
+	} else {
+		# Snapin
 		Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+		$moduleLoaded = $true
 	}
 }
 
@@ -637,51 +679,40 @@ function ExportXml
 	
 	PROCESS
 	{
-		$path = "$pathxml\$name" + "temp.xml"
+		# Write directly to final location (performance optimization - no temp file needed)
 		$newpath = "$pathxml\$name" + ".xml"
 		
 		if ($switch -like "normal")
 		{
+			# Get cached module path (performance optimization)
+			$moduleInfo = Get-VeeamModulePath
+			
 			Start-Job -Name $name -ScriptBlock {
 				# Suppress warnings and errors
 				$ErrorActionPreference = 'SilentlyContinue'
 				$WarningPreference = 'SilentlyContinue'
 				
-				# Load Veeam PowerShell module or snapin
+				# Load Veeam PowerShell module or snapin using cached path
 				$moduleLoaded = $false
-				# Try direct paths first (more reliable in background jobs)
-				$possiblePaths = @(
-					"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
-					"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
-				)
-				foreach ($path in $possiblePaths) {
-					if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
-						Import-Module $path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-						if (Get-Module -Name Veeam.Backup.PowerShell) {
-							$moduleLoaded = $true
-							break
-						}
-					}
-				}
-				# Fallback to standard module path
-				if (-not $moduleLoaded) {
-					if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+				if ($args[4].Type -eq "Module") {
+					if ($args[4].Path -eq "Veeam.Backup.PowerShell") {
 						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-						if (Get-Module -Name Veeam.Backup.PowerShell) {
-							$moduleLoaded = $true
-						}
+					} else {
+						Import-Module $args[4].Path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
 					}
-				}
-				# Final fallback to snapin (Veeam 12)
-				if (-not $moduleLoaded) {
+					if (Get-Module -Name Veeam.Backup.PowerShell) {
+						$moduleLoaded = $true
+					}
+				} else {
 					Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+					$moduleLoaded = $true
 				}
+				
 				$connectVeeam = Connect-VBRServer
+				# Write directly to final location (performance optimization)
 				Invoke-Expression $args[0] | Export-Clixml $args[1]
 				$disconnectVeeam = Disconnect-VBRServer
-				Copy-Item -Path $args[1] -Destination $args[3]
-				Remove-Item $args[1]
-			} -ArgumentList "$command", "$path", "$name", "$newpath"
+			} -ArgumentList "$command", "$newpath", "$name", "$newpath", $moduleInfo
 		}
 		
 		
@@ -693,99 +724,88 @@ function ExportXml
 			} else {
 				$commandnew = "$command " + "| Where-Object { `$_.JobType -eq `"$type`" }"
 			}
+			# Get cached module path (performance optimization)
+			$moduleInfo = Get-VeeamModulePath
+			
 			Start-Job -Name $name -ScriptBlock {
 				# Suppress warnings and errors
 				$ErrorActionPreference = 'SilentlyContinue'
 				$WarningPreference = 'SilentlyContinue'
 				
-				# Load Veeam PowerShell module or snapin
+				# Load Veeam PowerShell module or snapin using cached path
 				$moduleLoaded = $false
-				# Try direct paths first (more reliable in background jobs)
-				$possiblePaths = @(
-					"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
-					"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
-				)
-				foreach ($path in $possiblePaths) {
-					if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
-						Import-Module $path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-						if (Get-Module -Name Veeam.Backup.PowerShell) {
-							$moduleLoaded = $true
-							break
-						}
-					}
-				}
-				# Fallback to standard module path
-				if (-not $moduleLoaded) {
-					if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+				if ($args[4].Type -eq "Module") {
+					if ($args[4].Path -eq "Veeam.Backup.PowerShell") {
 						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-						if (Get-Module -Name Veeam.Backup.PowerShell) {
-							$moduleLoaded = $true
-						}
+					} else {
+						Import-Module $args[4].Path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
 					}
-				}
-				# Final fallback to snapin (Veeam 12)
-				if (-not $moduleLoaded) {
+					if (Get-Module -Name Veeam.Backup.PowerShell) {
+						$moduleLoaded = $true
+					}
+				} else {
 					Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+					$moduleLoaded = $true
 				}
+				
 				$connectVeeam = Connect-VBRServer
 				$BackupVmByJob = Invoke-Expression $args[0] | ForEach-Object {
 					$JobName = $_.Name
 					$_ | Get-VBRJobObject | Where-Object { $_.Object.Type -eq "VM" } | Select-Object @{ L = "Job"; E = { $JobName } }, Name | Sort-Object -Property Job, Name
 				}
+				# Write directly to final location (performance optimization)
 				$BackupVmByJob | Export-Clixml $args[1]
 				$disconnectVeeam = Disconnect-VBRServer
-				Copy-Item -Path $args[1] -Destination $args[3]
-				Remove-Item $args[1]
-			} -ArgumentList "$commandnew", "$path", "$name", "$newpath"
+			} -ArgumentList "$commandnew", "$newpath", "$name", "$newpath", $moduleInfo
 		}
 		
 		if ($switch -like "bytaskswithretry")
 		{
+			# Get cached module path (performance optimization)
+			$moduleInfo = Get-VeeamModulePath
+			
 			Start-Job -Name $name -ScriptBlock {
 				# Suppress warnings and errors
 				$ErrorActionPreference = 'SilentlyContinue'
 				$WarningPreference = 'SilentlyContinue'
 				
-				# Load Veeam PowerShell module or snapin
+				# Load Veeam PowerShell module or snapin using cached path
 				$moduleLoaded = $false
-				# Try direct paths first (more reliable in background jobs)
-				$possiblePaths = @(
-					"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
-					"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
-				)
-				foreach ($path in $possiblePaths) {
-					if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
-						Import-Module $path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-						if (Get-Module -Name Veeam.Backup.PowerShell) {
-							$moduleLoaded = $true
-							break
-						}
-					}
-				}
-				# Fallback to standard module path
-				if (-not $moduleLoaded) {
-					if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+				if ($args[5].Type -eq "Module") {
+					if ($args[5].Path -eq "Veeam.Backup.PowerShell") {
 						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-						if (Get-Module -Name Veeam.Backup.PowerShell) {
-							$moduleLoaded = $true
-						}
+					} else {
+						Import-Module $args[5].Path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
 					}
-				}
-				# Final fallback to snapin (Veeam 12)
-				if (-not $moduleLoaded) {
+					if (Get-Module -Name Veeam.Backup.PowerShell) {
+						$moduleLoaded = $true
+					}
+				} else {
 					Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+					$moduleLoaded = $true
 				}
+				
 				$connectVeeam = Connect-VBRServer
 				$StartDate = (Get-Date).adddays($args[4])
-				$BackupSessions = Get-VBRBackupSession | Where-Object { $_.CreationTime -ge $StartDate } | Sort-Object JobName, CreationTime
+				# Optimized filtering: Combine date and IsRetryMode filters in single query
+				$BackupSessions = Get-VBRBackupSession | Where-Object { $_.CreationTime -ge $StartDate -and $_.IsRetryMode -eq $false } | Sort-Object JobName, CreationTime
+				# Get retry sessions separately for failed sessions only
+				$RetrySessionsMap = @{}
+				$AllRetrySessions = Get-VBRBackupSession | Where-Object { $_.CreationTime -ge $StartDate -and $_.IsRetryMode -eq $true }
+				foreach ($retry in $AllRetrySessions) {
+					if (-not $RetrySessionsMap.ContainsKey($retry.OriginalSessionId)) {
+						$RetrySessionsMap[$retry.OriginalSessionId] = @()
+					}
+					$RetrySessionsMap[$retry.OriginalSessionId] += $retry
+				}
+				
 				$Result = & {
-					ForEach ($BackupSession in ($BackupSessions | Where-Object { $_.IsRetryMode -eq $false }))
+					ForEach ($BackupSession in $BackupSessions)
 					{
 						[System.Collections.ArrayList]$TaskSessions = @($BackupSession | Get-VBRTaskSession)
-						If ($BackupSession.Result -eq "Failed")
+						If ($BackupSession.Result -eq "Failed" -and $RetrySessionsMap.ContainsKey($BackupSession.Id))
 						{
-							$RetrySessions = $BackupSessions | Where-Object { ($_.IsRetryMode -eq $true) -and ($_.OriginalSessionId -eq $BackupSession.Id) }
-							ForEach ($RetrySession in $RetrySessions)
+							ForEach ($RetrySession in $RetrySessionsMap[$BackupSession.Id])
 							{
 								[System.Collections.ArrayList]$RetryTaskSessions = @($RetrySession | Get-VBRTaskSession)
 								ForEach ($RetryTaskSession in $RetryTaskSessions)
@@ -799,11 +819,10 @@ function ExportXml
 						$TaskSessions | Select-Object @{ N = "JobName"; E = { $BackupSession.JobName } }, @{ N = "JobId"; E = { $BackupSession.JobId } }, @{ N = "SessionName"; E = { $_.JobSess.Name } }, @{ N = "JobResult"; E = { $_.JobSess.Result } }, @{ N = "JobStart"; E = { $_.JobSess.CreationTime } }, @{ N = "JobEnd"; E = { $_.JobSess.EndTime } }, @{ N = "Date"; E = { $_.JobSess.CreationTime.ToString("yyyy-MM-dd") } }, name, status
 					}
 				}
+				# Write directly to final location (performance optimization)
 				$Result | Export-Clixml $args[1]
 				$disconnectVeeam = Disconnect-VBRServer
-				Copy-Item -Path $args[1] -Destination $args[3]
-				Remove-Item $args[1]
-			} -ArgumentList "$commandnew", "$path", "$name", "$newpath", "$days"
+			} -ArgumentList "$commandnew", "$newpath", "$name", "$newpath", "$days", $moduleInfo
 		}
 		
 		# Purge completed Job 
@@ -1021,18 +1040,20 @@ switch ($ITEM)
 		if ($test -like "False")
 		{
 			$query = New-Item -ItemType Directory -Force -Path "$pathxml"
-		}      
-        
+		}
+		
+		# Pre-discover and cache module path for all background jobs (performance optimization)
+		$null = Get-VeeamModulePath
 		       
-			$job = ExportXml -command Get-VBRBackupSession -name backupsession -switch normal
-			$job0 = ExportXml -command Get-VBRJob -name backupjob -switch normal
-			$job1 = ExportXml -command Get-VBRBackup -name backupbackup -switch normal
-			$job2 = ExportXml -command Get-VBRTapeJob -name backuptape -switch normal
-			$job3 = ExportXml -command Get-VBREPJob -name backupendpoint -switch normal
-			$job4 = ExportXml -command Get-VBRJob -name backupvmbyjob -switch byvm -type Backup
-			$job5 = ExportXml -command Get-VBRJob -name backupsyncvmbyjob -switch byvm -type BackupSync
-			$job6 = ExportXml -name backuptaskswithretry -switch bytaskswithretry
-			Get-Job | Wait-Job
+		$job = ExportXml -command Get-VBRBackupSession -name backupsession -switch normal
+		$job0 = ExportXml -command Get-VBRJob -name backupjob -switch normal
+		$job1 = ExportXml -command Get-VBRBackup -name backupbackup -switch normal
+		$job2 = ExportXml -command Get-VBRTapeJob -name backuptape -switch normal
+		$job3 = ExportXml -command Get-VBREPJob -name backupendpoint -switch normal
+		$job4 = ExportXml -command Get-VBRJob -name backupvmbyjob -switch byvm -type Backup
+		$job5 = ExportXml -command Get-VBRJob -name backupsyncvmbyjob -switch byvm -type BackupSync
+		$job6 = ExportXml -name backuptaskswithretry -switch bytaskswithretry
+		Get-Job | Wait-Job
 		
 	}
 	
