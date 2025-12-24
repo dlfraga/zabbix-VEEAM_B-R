@@ -1,12 +1,9 @@
- :warning: DEPRECATED : Use SQL version for Zabbix 6.X: https://github.com/romainsi/zabbix-VB-R-SQL.
-
 # VEEAM-Backup-Recovery-jobs
 
 This template use the VEEAM Backup & Replication PowerShell Cmdlets to discover and manage VEEAM Backup jobs, Veeam BackupSync, Veeam Tape Job, Veeam Endpoint Backup Jobs, All Repositories and Veeam Services.
 
-- Work with Veeam backup & replication V7 to V9.5
-- Work with Zabbix 3.X (english template only for V3.X) & 4.X
-- French & English translation for the Template
+- Work with Veeam backup & replication v13
+- Work with Zabbix 7.0
 
 ### Explanation of how it works:
 The "Result Export Xml Veeam" item sends a powershell command (with `nowait` option) to the host to create an xml file of the result of the `Get-VBRBbackupSession`, `Get-VBRJob`, `Get-VRBBackup` and `Get-VBREPJob` commands that is stored under `C:\Program Files\Zabbix Agent\scripts\TempXmlVeeam\*.xml` (variable `$pathxml`).
