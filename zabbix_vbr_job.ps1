@@ -5,7 +5,8 @@
 #
 # USAGE:
 #
-#   as a script:    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" <ITEM_TO_QUERY> <JOBID>or<JOBNAME> <TRIGGERLEVEL>
+#   as a script:    pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" <ITEM_TO_QUERY> <JOBID>or<JOBNAME> <TRIGGERLEVEL>
+#                    (For Veeam 13+, use pwsh.exe. For Veeam 12, use powershell.exe)
 #   as an item:     vbr[<ITEM_TO_QUERY>,<JOBID>or<JOBNAME>,<TRIGGERLEVEL>]
 #
 #
@@ -22,9 +23,9 @@
 # - RunningJob
 #
 # Examples:
-# powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" DiscoveryBackupJobs
+# pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" DiscoveryBackupJobs
 # Return a Json Value with all Backups Name and JobID 
-# Xml must be present in 'C:\Program Files\Zabbix Agent\scripts\TempXmlVeeam\*.xml', if not, you can launch manually : powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" ExportXml
+# Xml must be present in 'C:\Program Files\Zabbix Agent\scripts\TempXmlVeeam\*.xml', if not, you can launch manually : pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" ExportXml
 #
 # ITEMS availables (Switch) with JOBID Mandatory :
 # - ResultBackup
@@ -42,20 +43,37 @@
 # - VmCountResultBackupSync
 # - Type
 # - NextRunTime
+# - LastEndTime          Returns Unix timestamp of when backup metadata was last updated (from backupbackup.xml MetaUpdateTime)
+# - LastRunTime          Returns Unix timestamp of when the job last completed/finished (from backupsession.xml EndTime)
 #
 # Examples:
-# powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" ResultBackup "2fd246be-b32a-4c65-be3e-1ca5546ef225"
-# Return the value of result (see the VeeamStatusReplace function for correspondence)
+# pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" ResultBackup "2fd246be-b32a-4c65-be3e-1ca5546ef225"
+# Return the value of result (see the veeam-replace function for correspondence)
 # or
-# powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" VmCountResultBackup "BackupJob1" "Warning"
+# pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" VmCountResultBackup "BackupJob1" "Warning"
 #
-# Xml must be present in 'C:\Program Files\Zabbix Agent\scripts\TempXmlVeeam\*.xml', if not, you can launch manually : powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" ExportXml
+# Xml must be present in 'C:\Program Files\Zabbix Agent\scripts\TempXmlVeeam\*.xml', if not, you can launch manually : pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" ExportXml
 #
 #
 #
 # Add to Zabbix Agent
-#   UserParameter=vbr[*],powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" "$1" "$2" "$3"
+#   For Veeam 13+: UserParameter=vbr[*],"C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" "$1" "$2" "$3"
+#   For Veeam 12:  UserParameter=vbr[*],powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zabbix Agent\scripts\zabbix_vbr_job.ps1" "$1" "$2" "$3"
+#
+# NOTE: Veeam 13 requires PowerShell 7.0 or higher. If you're using Veeam 13, you MUST use pwsh.exe instead of powershell.exe
 
+# Check PowerShell version - Veeam 13 requires PowerShell 7.0+
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+	$pwshPath = "C:\Program Files\PowerShell\7\pwsh.exe"
+	if (Test-Path $pwshPath) {
+		# Relaunch with PowerShell 7
+		& $pwshPath -NoProfile -ExecutionPolicy Bypass -File $MyInvocation.MyCommand.Path $args
+		exit $LASTEXITCODE
+	} else {
+		Write-Error "Veeam 13 requires PowerShell 7.0 or higher. Current version: $($PSVersionTable.PSVersion). Please install PowerShell 7 or update your Zabbix agent configuration to use pwsh.exe instead of powershell.exe."
+		exit 1
+	}
+}
 
 # If you change the pathxml modify also the item Result Export XML with the new location in zabbix template
 $pathxml = 'C:\Program Files\Zabbix Agent\scripts\TempXmlVeeam'
@@ -67,14 +85,540 @@ $pathxml = 'C:\Program Files\Zabbix Agent\scripts\TempXmlVeeam'
 # but if you have only daily job ajust to '-2' days.
 # ! This request can consume a lot of cpu resources, adjust carefully !
 # 
-$days = '-31'
+$days = '-3'
+
+# Function convert return Json String to html
+function convertto-encoding
+{
+	[CmdletBinding()]
+	Param (
+		[Parameter(ValueFromPipeline = $true)]
+		[string]$item,
+		[Parameter(Mandatory = $true)]
+		[string]$switch
+	)
+	if ($switch -like "in")
+	{
+		$item.replace('&', '&amp;').replace('à', '&agrave;').replace('â', '&acirc;').replace('è', '&egrave;').replace('é', '&eacute;').replace('ê', '&ecirc;')
+	}
+	if ($switch -like "out")
+	{
+		$item.replace('&amp;', '&').replace('&agrave;', 'à').replace('&acirc;', 'â').replace('&egrave;', 'è').replace('&eacute;', 'é').replace('&ecirc;', 'ê')
+	}
+}
 
 $ITEM = [string]$args[0]
-$ID = [string]$args[1]
-$ID0 = [string]$args[2]
+$ID = [string]$args[1] | convertto-encoding -switch out
+$ID0 = [string]$args[2] | convertto-encoding -switch out
 
-# Load Veeam Module
-Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+# Function to test Veeam PowerShell module loading and connection
+function Test-VeeamHealth
+{
+	[CmdletBinding()]
+	Param()
+	
+	$errors = @()
+	$warnings = @()
+	
+	Write-Host "=== Veeam PowerShell Health Check ===" -ForegroundColor Cyan
+	Write-Host ""
+	
+	# Check PowerShell version
+	Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)" -ForegroundColor White
+	if ($PSVersionTable.PSVersion.Major -lt 7) {
+		$warnings += "PowerShell version is below 7.0. Veeam 13+ requires PowerShell 7.0 or higher."
+		Write-Host "  WARNING: PowerShell version is below 7.0" -ForegroundColor Yellow
+	} else {
+		Write-Host "  OK: PowerShell version is 7.0 or higher" -ForegroundColor Green
+	}
+	Write-Host ""
+	
+	# Test module loading
+	Write-Host "Testing Veeam PowerShell Module Loading..." -ForegroundColor White
+	$moduleLoaded = $false
+	$moduleName = $null
+	
+	# Try Veeam 13+ module first
+	if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+		try {
+			Import-Module Veeam.Backup.PowerShell -ErrorAction Stop -WarningAction SilentlyContinue
+			if (Get-Module -Name Veeam.Backup.PowerShell) {
+				$moduleLoaded = $true
+				$moduleName = "Veeam.Backup.PowerShell (Module)"
+				Write-Host "  OK: Veeam.Backup.PowerShell module loaded successfully" -ForegroundColor Green
+			}
+		} catch {
+			$errors += "Failed to import Veeam.Backup.PowerShell module: $($_.Exception.Message)"
+			Write-Host "  ERROR: Failed to import module - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	}
+	
+	# Try direct paths
+	if (-not $moduleLoaded) {
+		$possiblePaths = @(
+			"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
+			"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
+		)
+		
+		foreach ($path in $possiblePaths) {
+			if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
+				try {
+					Import-Module $path -ErrorAction Stop -WarningAction SilentlyContinue
+					if (Get-Module -Name Veeam.Backup.PowerShell) {
+						$moduleLoaded = $true
+						$moduleName = "Veeam.Backup.PowerShell (Module from $path)"
+						Write-Host "  OK: Veeam.Backup.PowerShell module loaded from $path" -ForegroundColor Green
+						break
+					}
+				} catch {
+					$errors += "Failed to import Veeam.Backup.PowerShell module from $path : $($_.Exception.Message)"
+					Write-Host "  ERROR: Failed to import from $path - $($_.Exception.Message)" -ForegroundColor Red
+				}
+			}
+		}
+	}
+	
+	# Try snapin (Veeam 12)
+	if (-not $moduleLoaded) {
+		try {
+			Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction Stop
+			$moduleLoaded = $true
+			$moduleName = "VeeamPSSnapIn (Snapin)"
+			Write-Host "  OK: VeeamPSSnapIn snapin loaded successfully" -ForegroundColor Green
+		} catch {
+			$errors += "Failed to load VeeamPSSnapIn snapin: $($_.Exception.Message)"
+			Write-Host "  ERROR: Failed to load snapin - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	}
+	
+	if (-not $moduleLoaded) {
+		$errors += "Could not load Veeam PowerShell module or snapin. Veeam may not be installed or module path is incorrect."
+		Write-Host "  ERROR: Could not load Veeam PowerShell module or snapin" -ForegroundColor Red
+		Write-Host ""
+		Write-Host "=== Health Check FAILED ===" -ForegroundColor Red
+		Write-Host ""
+		return $false
+	}
+	
+	Write-Host "  Module Type: $moduleName" -ForegroundColor Gray
+	Write-Host ""
+	
+	# Test Veeam connection
+	# Note: Connect-VBRServer may return $null even when connection is successful
+	# So we test the connection by actually using a Veeam cmdlet
+	Write-Host "Testing Veeam Server Connection..." -ForegroundColor White
+	try {
+		$null = Connect-VBRServer -ErrorAction Stop
+		# Test connection by trying to execute a simple Veeam cmdlet
+		$connectionTest = Get-VBRJob -ErrorAction Stop | Select-Object -First 1
+		Write-Host "  OK: Successfully connected to Veeam Backup Server" -ForegroundColor Green
+	} catch {
+		$errors += "Failed to connect to Veeam Backup Server: $($_.Exception.Message)"
+		Write-Host "  ERROR: Connection failed - $($_.Exception.Message)" -ForegroundColor Red
+		Write-Host ""
+		Write-Host "=== Health Check FAILED ===" -ForegroundColor Red
+		Write-Host ""
+		return $false
+	}
+	Write-Host ""
+	
+	# Test basic Veeam cmdlets
+	Write-Host "Testing Veeam Cmdlets..." -ForegroundColor White
+	$cmdletTests = @(
+		@{ Name = "Get-VBRJob"; Test = { Get-VBRJob -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRBackupSession"; Test = { Get-VBRBackupSession -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRBackup"; Test = { Get-VBRBackup -ErrorAction Stop | Select-Object -First 1 } }
+	)
+	
+	$cmdletErrors = 0
+	foreach ($cmdlet in $cmdletTests) {
+		try {
+			$result = & $cmdlet.Test
+			Write-Host "  OK: $($cmdlet.Name) executed successfully" -ForegroundColor Green
+		} catch {
+			$cmdletErrors++
+			$errors += "$($cmdlet.Name) failed: $($_.Exception.Message)"
+			Write-Host "  ERROR: $($cmdlet.Name) failed - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	}
+	Write-Host ""
+	
+	# Test ExportXml data retrieval - verify all cmdlets used by ExportXml can return data
+	Write-Host "Testing ExportXml Data Retrieval..." -ForegroundColor White
+	$exportXmlTests = @(
+		@{ Name = "Get-VBRBackupSession (for backupsession.xml)"; Test = { Get-VBRBackupSession -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRJob (for backupjob.xml)"; Test = { Get-VBRJob -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRBackup (for backupbackup.xml)"; Test = { Get-VBRBackup -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRTapeJob (for backuptape.xml)"; Test = { Get-VBRTapeJob -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBREPJob (for backupendpoint.xml)"; Test = { Get-VBREPJob -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRJob with Backup filter (for backupvmbyjob.xml)"; Test = { Get-VBRJob -ErrorAction Stop | Where-Object { $_.JobType -eq "Backup" } | Select-Object -First 1 } },
+		@{ Name = "Get-VBRBackupCopyJob (for backupsyncvmbyjob.xml)"; Test = { Get-VBRBackupCopyJob -ErrorAction Stop | Select-Object -First 1 } }
+	)
+	
+	$exportXmlErrors = 0
+	foreach ($test in $exportXmlTests) {
+		try {
+			$result = & $test.Test
+			if ($null -eq $result) {
+				Write-Host "  WARNING: $($test.Name) returned no data (may be expected if no jobs exist)" -ForegroundColor Yellow
+			} else {
+				Write-Host "  OK: $($test.Name) returned data" -ForegroundColor Green
+			}
+		} catch {
+			$exportXmlErrors++
+			$errors += "$($test.Name) failed: $($_.Exception.Message)"
+			Write-Host "  ERROR: $($test.Name) failed - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	}
+	Write-Host ""
+	
+	# Test XML serialization and directory write access
+	Write-Host "Testing XML Export Capabilities..." -ForegroundColor White
+	try {
+		# Test if XML directory exists and is writable
+		$testPath = 'C:\Program Files\Zabbix Agent\scripts\TempXmlVeeam'
+		if (-not (Test-Path $testPath)) {
+			try {
+				New-Item -ItemType Directory -Force -Path $testPath -ErrorAction Stop | Out-Null
+				Write-Host "  OK: XML directory created: $testPath" -ForegroundColor Green
+			} catch {
+				$errors += "Cannot create XML directory $testPath : $($_.Exception.Message)"
+				Write-Host "  ERROR: Cannot create XML directory - $($_.Exception.Message)" -ForegroundColor Red
+			}
+		} else {
+			Write-Host "  OK: XML directory exists: $testPath" -ForegroundColor Green
+		}
+		
+		# Test if we can write to the directory
+		$testFile = Join-Path $testPath "healthcheck_test.xml"
+		try {
+			$testData = Get-VBRJob -ErrorAction Stop | Select-Object -First 1
+			if ($testData) {
+				$testData | Export-Clixml $testFile -ErrorAction Stop
+				if (Test-Path $testFile) {
+					Write-Host "  OK: XML serialization test successful" -ForegroundColor Green
+					Remove-Item $testFile -ErrorAction SilentlyContinue
+				} else {
+					$errors += "XML file was not created during test"
+					Write-Host "  ERROR: XML file was not created" -ForegroundColor Red
+				}
+			} else {
+				Write-Host "  WARNING: No data available for XML serialization test" -ForegroundColor Yellow
+			}
+		} catch {
+			$errors += "XML serialization test failed: $($_.Exception.Message)"
+			Write-Host "  ERROR: XML serialization test failed - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	} catch {
+		$errors += "XML export capability test failed: $($_.Exception.Message)"
+		Write-Host "  ERROR: XML export capability test failed - $($_.Exception.Message)" -ForegroundColor Red
+	}
+	Write-Host ""
+	
+	# Disconnect
+	try {
+		Disconnect-VBRServer -ErrorAction SilentlyContinue
+	} catch {
+		# Ignore disconnect errors
+	}
+	
+	# Summary
+	if ($errors.Count -eq 0) {
+		Write-Host "=== Health Check PASSED ===" -ForegroundColor Green
+		Write-Host ""
+		return $true
+	} else {
+		Write-Host "=== Health Check FAILED ===" -ForegroundColor Red
+		Write-Host ""
+		Write-Host "Errors found:" -ForegroundColor Red
+		foreach ($error in $errors) {
+			Write-Host "  - $error" -ForegroundColor Red
+		}
+		Write-Host ""
+		return $false
+	}
+}
+
+# Function to test Veeam PowerShell module loading and connection
+function Test-VeeamHealth
+{
+	[CmdletBinding()]
+	Param()
+	
+	$errors = @()
+	$warnings = @()
+	
+	Write-Host "=== Veeam PowerShell Health Check ===" -ForegroundColor Cyan
+	Write-Host ""
+	
+	# Check PowerShell version
+	Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)" -ForegroundColor White
+	if ($PSVersionTable.PSVersion.Major -lt 7) {
+		$warnings += "PowerShell version is below 7.0. Veeam 13+ requires PowerShell 7.0 or higher."
+		Write-Host "  WARNING: PowerShell version is below 7.0" -ForegroundColor Yellow
+	} else {
+		Write-Host "  OK: PowerShell version is 7.0 or higher" -ForegroundColor Green
+	}
+	Write-Host ""
+	
+	# Test module loading
+	Write-Host "Testing Veeam PowerShell Module Loading..." -ForegroundColor White
+	$moduleLoaded = $false
+	$moduleName = $null
+	
+	# Try Veeam 13+ module first
+	if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+		try {
+			Import-Module Veeam.Backup.PowerShell -ErrorAction Stop -WarningAction SilentlyContinue
+			if (Get-Module -Name Veeam.Backup.PowerShell) {
+				$moduleLoaded = $true
+				$moduleName = "Veeam.Backup.PowerShell (Module)"
+				Write-Host "  OK: Veeam.Backup.PowerShell module loaded successfully" -ForegroundColor Green
+			}
+		} catch {
+			$errors += "Failed to import Veeam.Backup.PowerShell module: $($_.Exception.Message)"
+			Write-Host "  ERROR: Failed to import module - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	}
+	
+	# Try direct paths
+	if (-not $moduleLoaded) {
+		$possiblePaths = @(
+			"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
+			"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
+		)
+		
+		foreach ($path in $possiblePaths) {
+			if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
+				try {
+					Import-Module $path -ErrorAction Stop -WarningAction SilentlyContinue
+					if (Get-Module -Name Veeam.Backup.PowerShell) {
+						$moduleLoaded = $true
+						$moduleName = "Veeam.Backup.PowerShell (Module from $path)"
+						Write-Host "  OK: Veeam.Backup.PowerShell module loaded from $path" -ForegroundColor Green
+						break
+					}
+				} catch {
+					$errors += "Failed to import Veeam.Backup.PowerShell module from $path : $($_.Exception.Message)"
+					Write-Host "  ERROR: Failed to import from $path - $($_.Exception.Message)" -ForegroundColor Red
+				}
+			}
+		}
+	}
+	
+	# Try snapin (Veeam 12)
+	if (-not $moduleLoaded) {
+		try {
+			Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction Stop
+			$moduleLoaded = $true
+			$moduleName = "VeeamPSSnapIn (Snapin)"
+			Write-Host "  OK: VeeamPSSnapIn snapin loaded successfully" -ForegroundColor Green
+		} catch {
+			$errors += "Failed to load VeeamPSSnapIn snapin: $($_.Exception.Message)"
+			Write-Host "  ERROR: Failed to load snapin - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	}
+	
+	if (-not $moduleLoaded) {
+		$errors += "Could not load Veeam PowerShell module or snapin. Veeam may not be installed or module path is incorrect."
+		Write-Host "  ERROR: Could not load Veeam PowerShell module or snapin" -ForegroundColor Red
+		Write-Host ""
+		Write-Host "=== Health Check FAILED ===" -ForegroundColor Red
+		Write-Host ""
+		return $false
+	}
+	
+	Write-Host "  Module Type: $moduleName" -ForegroundColor Gray
+	Write-Host ""
+	
+	# Test Veeam connection
+	# Note: Connect-VBRServer may return $null even when connection is successful
+	# So we test the connection by actually using a Veeam cmdlet
+	Write-Host "Testing Veeam Server Connection..." -ForegroundColor White
+	try {
+		$null = Connect-VBRServer -ErrorAction Stop
+		# Test connection by trying to execute a simple Veeam cmdlet
+		$connectionTest = Get-VBRJob -ErrorAction Stop | Select-Object -First 1
+		Write-Host "  OK: Successfully connected to Veeam Backup Server" -ForegroundColor Green
+	} catch {
+		$errors += "Failed to connect to Veeam Backup Server: $($_.Exception.Message)"
+		Write-Host "  ERROR: Connection failed - $($_.Exception.Message)" -ForegroundColor Red
+		Write-Host ""
+		Write-Host "=== Health Check FAILED ===" -ForegroundColor Red
+		Write-Host ""
+		return $false
+	}
+	Write-Host ""
+	
+	# Test basic Veeam cmdlets
+	Write-Host "Testing Veeam Cmdlets..." -ForegroundColor White
+	$cmdletTests = @(
+		@{ Name = "Get-VBRJob"; Test = { Get-VBRJob -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRBackupSession"; Test = { Get-VBRBackupSession -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRBackup"; Test = { Get-VBRBackup -ErrorAction Stop | Select-Object -First 1 } }
+	)
+	
+	$cmdletErrors = 0
+	foreach ($cmdlet in $cmdletTests) {
+		try {
+			$result = & $cmdlet.Test
+			Write-Host "  OK: $($cmdlet.Name) executed successfully" -ForegroundColor Green
+		} catch {
+			$cmdletErrors++
+			$errors += "$($cmdlet.Name) failed: $($_.Exception.Message)"
+			Write-Host "  ERROR: $($cmdlet.Name) failed - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	}
+	Write-Host ""
+	
+	# Test ExportXml data retrieval - verify all cmdlets used by ExportXml can return data
+	Write-Host "Testing ExportXml Data Retrieval..." -ForegroundColor White
+	$exportXmlTests = @(
+		@{ Name = "Get-VBRBackupSession (for backupsession.xml)"; Test = { Get-VBRBackupSession -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRJob (for backupjob.xml)"; Test = { Get-VBRJob -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRBackup (for backupbackup.xml)"; Test = { Get-VBRBackup -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRTapeJob (for backuptape.xml)"; Test = { Get-VBRTapeJob -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBREPJob (for backupendpoint.xml)"; Test = { Get-VBREPJob -ErrorAction Stop | Select-Object -First 1 } },
+		@{ Name = "Get-VBRJob with Backup filter (for backupvmbyjob.xml)"; Test = { Get-VBRJob -ErrorAction Stop | Where-Object { $_.JobType -eq "Backup" } | Select-Object -First 1 } },
+		@{ Name = "Get-VBRBackupCopyJob (for backupsyncvmbyjob.xml)"; Test = { Get-VBRBackupCopyJob -ErrorAction Stop | Select-Object -First 1 } }
+	)
+	
+	$exportXmlErrors = 0
+	foreach ($test in $exportXmlTests) {
+		try {
+			$result = & $test.Test
+			if ($null -eq $result) {
+				Write-Host "  WARNING: $($test.Name) returned no data (may be expected if no jobs exist)" -ForegroundColor Yellow
+			} else {
+				Write-Host "  OK: $($test.Name) returned data" -ForegroundColor Green
+			}
+		} catch {
+			$exportXmlErrors++
+			$errors += "$($test.Name) failed: $($_.Exception.Message)"
+			Write-Host "  ERROR: $($test.Name) failed - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	}
+	Write-Host ""
+	
+	# Test XML serialization and directory write access
+	Write-Host "Testing XML Export Capabilities..." -ForegroundColor White
+	try {
+		# Test if XML directory exists and is writable
+		$testPath = 'C:\Program Files\Zabbix Agent\scripts\TempXmlVeeam'
+		if (-not (Test-Path $testPath)) {
+			try {
+				New-Item -ItemType Directory -Force -Path $testPath -ErrorAction Stop | Out-Null
+				Write-Host "  OK: XML directory created: $testPath" -ForegroundColor Green
+			} catch {
+				$errors += "Cannot create XML directory $testPath : $($_.Exception.Message)"
+				Write-Host "  ERROR: Cannot create XML directory - $($_.Exception.Message)" -ForegroundColor Red
+			}
+		} else {
+			Write-Host "  OK: XML directory exists: $testPath" -ForegroundColor Green
+		}
+		
+		# Test if we can write to the directory
+		$testFile = Join-Path $testPath "healthcheck_test.xml"
+		try {
+			$testData = Get-VBRJob -ErrorAction Stop | Select-Object -First 1
+			if ($testData) {
+				$testData | Export-Clixml $testFile -ErrorAction Stop
+				if (Test-Path $testFile) {
+					Write-Host "  OK: XML serialization test successful" -ForegroundColor Green
+					Remove-Item $testFile -ErrorAction SilentlyContinue
+				} else {
+					$errors += "XML file was not created during test"
+					Write-Host "  ERROR: XML file was not created" -ForegroundColor Red
+				}
+			} else {
+				Write-Host "  WARNING: No data available for XML serialization test" -ForegroundColor Yellow
+			}
+		} catch {
+			$errors += "XML serialization test failed: $($_.Exception.Message)"
+			Write-Host "  ERROR: XML serialization test failed - $($_.Exception.Message)" -ForegroundColor Red
+		}
+	} catch {
+		$errors += "XML export capability test failed: $($_.Exception.Message)"
+		Write-Host "  ERROR: XML export capability test failed - $($_.Exception.Message)" -ForegroundColor Red
+	}
+	Write-Host ""
+	
+	# Disconnect
+	try {
+		Disconnect-VBRServer -ErrorAction SilentlyContinue
+	} catch {
+		# Ignore disconnect errors
+	}
+	
+	# Summary
+	if ($errors.Count -eq 0) {
+		Write-Host "=== Health Check PASSED ===" -ForegroundColor Green
+		Write-Host ""
+		return $true
+	} else {
+		Write-Host "=== Health Check FAILED ===" -ForegroundColor Red
+		Write-Host ""
+		Write-Host "Errors found:" -ForegroundColor Red
+		foreach ($error in $errors) {
+			Write-Host "  - $error" -ForegroundColor Red
+		}
+		Write-Host ""
+		return $false
+	}
+}
+
+# Function to load Veeam PowerShell module or snapin
+function Load-VeeamPowerShell
+{
+	[CmdletBinding()]
+	Param()
+	
+	$moduleLoaded = $false
+	
+	# Try to import from standard module paths (Veeam 13+)
+	if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+		Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+		if (Get-Module -Name Veeam.Backup.PowerShell) {
+			$moduleLoaded = $true
+		}
+	}
+	
+	# If not loaded, try to find module in Veeam installation directory
+	if (-not $moduleLoaded) {
+		$modulePath = $null
+		# Try common installation paths
+		$possiblePaths = @(
+			"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
+			"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
+		)
+		
+		# Try to get from registry
+		try {
+			$installDir = (Get-ItemProperty -Path "HKLM:\Software\Veeam\Veeam Backup and Replication" -Name "InstallDir" -ErrorAction SilentlyContinue).InstallDir
+			if ($installDir) {
+				$modulePathFromReg = Join-Path $installDir "Backup\BackupClient\Veeam.Backup.PowerShell"
+				if (Test-Path $modulePathFromReg) {
+					$possiblePaths = @($modulePathFromReg) + $possiblePaths
+				}
+			}
+		} catch {}
+		
+		foreach ($path in $possiblePaths) {
+			if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
+				Import-Module $path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+				if (Get-Module -Name Veeam.Backup.PowerShell) {
+					$moduleLoaded = $true
+					break
+				}
+			}
+		}
+	}
+	
+	# Fall back to snapin (Veeam 12 and earlier)
+	if (-not $moduleLoaded) {
+		Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+	}
+}
 
 # Function Multiprocess ExportXml
 function ExportXml
@@ -88,9 +632,7 @@ function ExportXml
 		[Parameter(Mandatory = $false)]
 		[string]$command,
 		[Parameter(Mandatory = $false)]
-		[string]$type,
-		[Parameter(Mandatory = $false)]
-		[string]$options
+		[string]$type
 	)
 	
 	PROCESS
@@ -100,14 +642,40 @@ function ExportXml
 		
 		if ($switch -like "normal")
 		{
-			[System.DateTime]$Date = (Get-Date).adddays($days) #.ToString('dd/MM/yyyy HH:mm:ss')
-			if ($options -like "true")
-			{
-				$commandnew = "$command " + "| Where-Object { `$_.CreationTime -ge `"$Date`" }"
-				$command = $commandnew
-			}
 			Start-Job -Name $name -ScriptBlock {
-				Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+				# Suppress warnings and errors
+				$ErrorActionPreference = 'SilentlyContinue'
+				$WarningPreference = 'SilentlyContinue'
+				
+				# Load Veeam PowerShell module or snapin
+				$moduleLoaded = $false
+				# Try direct paths first (more reliable in background jobs)
+				$possiblePaths = @(
+					"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
+					"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
+				)
+				foreach ($path in $possiblePaths) {
+					if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
+						Import-Module $path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+						if (Get-Module -Name Veeam.Backup.PowerShell) {
+							$moduleLoaded = $true
+							break
+						}
+					}
+				}
+				# Fallback to standard module path
+				if (-not $moduleLoaded) {
+					if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+						if (Get-Module -Name Veeam.Backup.PowerShell) {
+							$moduleLoaded = $true
+						}
+					}
+				}
+				# Final fallback to snapin (Veeam 12)
+				if (-not $moduleLoaded) {
+					Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+				}
 				$connectVeeam = Connect-VBRServer
 				Invoke-Expression $args[0] | Export-Clixml $args[1]
 				$disconnectVeeam = Disconnect-VBRServer
@@ -116,11 +684,49 @@ function ExportXml
 			} -ArgumentList "$command", "$path", "$name", "$newpath"
 		}
 		
+		
 		if ($switch -like "byvm")
 		{
-			$commandnew = "$command " + "| Where-Object { `$_.JobType -eq `"$type`" }"
+			# For Veeam 13+, BackupSync jobs need to use Get-VBRBackupCopyJob instead of filtering Get-VBRJob
+			if ($type -eq "BackupSync") {
+				$commandnew = "Get-VBRBackupCopyJob"
+			} else {
+				$commandnew = "$command " + "| Where-Object { `$_.JobType -eq `"$type`" }"
+			}
 			Start-Job -Name $name -ScriptBlock {
-				Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+				# Suppress warnings and errors
+				$ErrorActionPreference = 'SilentlyContinue'
+				$WarningPreference = 'SilentlyContinue'
+				
+				# Load Veeam PowerShell module or snapin
+				$moduleLoaded = $false
+				# Try direct paths first (more reliable in background jobs)
+				$possiblePaths = @(
+					"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
+					"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
+				)
+				foreach ($path in $possiblePaths) {
+					if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
+						Import-Module $path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+						if (Get-Module -Name Veeam.Backup.PowerShell) {
+							$moduleLoaded = $true
+							break
+						}
+					}
+				}
+				# Fallback to standard module path
+				if (-not $moduleLoaded) {
+					if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+						if (Get-Module -Name Veeam.Backup.PowerShell) {
+							$moduleLoaded = $true
+						}
+					}
+				}
+				# Final fallback to snapin (Veeam 12)
+				if (-not $moduleLoaded) {
+					Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+				}
 				$connectVeeam = Connect-VBRServer
 				$BackupVmByJob = Invoke-Expression $args[0] | ForEach-Object {
 					$JobName = $_.Name
@@ -136,10 +742,42 @@ function ExportXml
 		if ($switch -like "bytaskswithretry")
 		{
 			Start-Job -Name $name -ScriptBlock {
-				Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+				# Suppress warnings and errors
+				$ErrorActionPreference = 'SilentlyContinue'
+				$WarningPreference = 'SilentlyContinue'
+				
+				# Load Veeam PowerShell module or snapin
+				$moduleLoaded = $false
+				# Try direct paths first (more reliable in background jobs)
+				$possiblePaths = @(
+					"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
+					"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
+				)
+				foreach ($path in $possiblePaths) {
+					if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
+						Import-Module $path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+						if (Get-Module -Name Veeam.Backup.PowerShell) {
+							$moduleLoaded = $true
+							break
+						}
+					}
+				}
+				# Fallback to standard module path
+				if (-not $moduleLoaded) {
+					if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+						if (Get-Module -Name Veeam.Backup.PowerShell) {
+							$moduleLoaded = $true
+						}
+					}
+				}
+				# Final fallback to snapin (Veeam 12)
+				if (-not $moduleLoaded) {
+					Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+				}
 				$connectVeeam = Connect-VBRServer
 				$StartDate = (Get-Date).adddays($args[4])
-				$BackupSessions = [Veeam.Backup.Core.CBackupSession]::GetAll() | Where-Object { $_.CreationTime -ge $StartDate } | Sort-Object JobName, CreationTime
+				$BackupSessions = Get-VBRBackupSession | Where-Object { $_.CreationTime -ge $StartDate } | Sort-Object JobName, CreationTime
 				$Result = & {
 					ForEach ($BackupSession in ($BackupSessions | Where-Object { $_.IsRetryMode -eq $false }))
 					{
@@ -173,6 +811,80 @@ function ExportXml
 	}
 }
 
+
+
+# Converts an object to a JSON-formatted string
+$GlobalConstant = @{
+	'ZabbixJsonHost' = 'host'
+	'ZabbixJsonKey' = 'key'
+	'ZabbixJsonValue' = 'value'
+	'ZabbixJsonTimestamp' = 'clock'
+	'ZabbixJsonRequest' = 'request'
+	'ZabbixJsonData' = 'data'
+	'ZabbixJsonSenderData' = 'sender data'
+	'ZabbixJsonDiscoveryKey' = '{{#{0}}}'
+}
+
+$GlobalConstant += @{
+	'ZabbixMappingProperty' = 'Property'
+	'ZabbixMappingKey' = 'Key'
+	'ZabbixMappingKeyProperty' = 'KeyProperty'
+}
+
+foreach ($Constant in $GlobalConstant.GetEnumerator())
+{
+	Set-Variable -Scope Global -Option ReadOnly -Name $Constant.Key -Value $Constant.Value -Force
+}
+
+$ExportFunction = ('ConvertTo-ZabbixDiscoveryJson')
+
+if ($Host.Version.Major -le 2)
+{
+	$ExportFunction += ('ConvertTo-Json', 'ConvertFrom-Json')
+}
+
+function ConvertTo-ZabbixDiscoveryJson
+{
+	[CmdletBinding()]
+	param
+	(
+		[Parameter(ValueFromPipeline = $true)]
+		$InputObject,
+		[Parameter(Position = 0)]
+		[String[]]$Property = "#JOBID"
+	)
+	
+	begin
+	{
+		$Result = @()
+	}
+	
+	process
+	{
+		if ($InputObject)
+		{
+			$Result += foreach ($Obj in $InputObject)
+			{
+				if ($Obj)
+				{
+					$Element = @{ }
+					foreach ($P in $Property)
+					{
+						$Key = $ZabbixJsonDiscoveryKey -f $P.ToUpper()
+						$Element[$Key] = [String]$Obj.$P
+					}
+					$Element
+				}
+			}
+		}
+	}
+	end
+	{
+		$Result = @{ $ZabbixJsonData = $Result }
+		return $Result | ConvertTo-Json -Compress | ForEach-Object { [System.Text.RegularExpressions.Regex]::Unescape($_) }
+	}
+}
+
 # Function import xml with check & delay time if copy process running
 function ImportXml
 {
@@ -184,7 +896,7 @@ function ImportXml
 	$result = Test-Path -Path $path
 	if ($result -like 'False')
 	{
-		start-sleep -Milliseconds 10
+		start-sleep -Seconds 1
 	}
 	
 	$err = $null
@@ -198,34 +910,19 @@ function ImportXml
 	}
 	If ($err -ne $null)
 	{
-		start-sleep -Milliseconds 50
+		Start-Sleep -Seconds 1
 		$xmlquery = Import-Clixml "$path"
 	}
 	$xmlquery
 }
 
 # Replace Function for Veeam Correlation
-function VeeamStatusReplace
+function veeam-replace
 {
 	[CmdletBinding()]
 	Param ([Parameter(ValueFromPipeline = $true)]
 		$item)
-	$item.replace('Failed', '0').
-	replace('Warning', '1').
-	replace('Success', '2').
-	replace('None', '2').
-	replace('idle', '3').
-	replace('InProgress', '5').
-	replace('Pending', '6').
-	replace('Pausing', '7').
-	replace('Postprocessing', '8').
-	replace('Resuming', '9').
-	replace('Starting', '10').
-	replace('Stopped', '11').
-	replace('Stopping', '12').
-	replace('WaitingRepository', '13').
-	replace('WaitingTape', '13').
-	replace('Working', '13')
+	$item.replace('Failed', '0').replace('Warning', '1').replace('Success', '2').replace('None', '2').replace('idle', '3').replace('InProgress', '5').replace('Pending', '6')
 }
 
 # Function Sort-Object VMs by jobs on last backup (with unique name if retry)
@@ -254,90 +951,67 @@ function veeam-backuptask-unique
 	$output
 }
 
-function ConvertTo-ZabbixDiscoveryJson
-{
-	[CmdletBinding()]
-	param
-	(
-		[Parameter(ValueFromPipeline = $true)]
-		$InputObject,
-		[Parameter(Position = 0)]
-		[String[]]$Property = @("ID", "NAME", "JOBTYPE")
-	)
-	
-	begin
-	{
-		$out = @()
-	}
-	
-	process
-	{
-		if ($InputObject)
-		{
-			$InputObject | ForEach-Object {
-				if ($_)
-				{
-					$Element = @{ }
-					foreach ($P in $Property)
-					{
-						$Element.Add("{#$($P.ToUpper())}", [String]$_.$P)
-					}
-					$out += $Element
-				}
-			}
-		}
-	}
-	end
-	{
-		@{ 'data' = $out } | ConvertTo-Json -Compress
+# Suppress warnings globally for clean Zabbix output
+$WarningPreference = 'SilentlyContinue'
+
+# If no parameters provided, run health check
+if ([string]::IsNullOrWhiteSpace($ITEM)) {
+	$healthCheckResult = Test-VeeamHealth
+	if ($healthCheckResult) {
+		exit 0
+	} else {
+		exit 1
 	}
 }
+
+# Load Veeam Module (try Veeam 13+ module first, then fall back to Veeam 12 snapin)
+Load-VeeamPowerShell
 
 switch ($ITEM)
 {
 	"DiscoveryBackupJobs" {
 		$xml1 = ImportXml -item backupjob
-		$query = $xml1 | Where-Object { $_.IsScheduleEnabled -eq "true" -and ($_.JobType -like "Backup" -or $_.JobType -like "EpAgentBackup") } | Select-Object @{ N = "JOBID"; E = { $_.ID } }, @{ N = "JOBNAME"; E = { $_.NAME } }
+		$query = $xml1 | Where-Object { $_.IsScheduleEnabled -eq "true" -and $_.JobType -like "Backup" } | Select-Object @{ N = "JOBID"; E = { $_.ID | convertto-encoding -switch in } }, @{ N = "JOBNAME"; E = { $_.NAME | convertto-encoding -switch in } }
 		$query | ConvertTo-ZabbixDiscoveryJson JOBNAME, JOBID
 	}
 	
 	"DiscoveryBackupSyncJobs" {
 		$xml1 = ImportXml -item backupjob
-		$query = $xml1 | Where-Object { $_.IsScheduleEnabled -eq "true" -and $_.JobType -like "BackupSync" } | Select-Object @{ N = "JOBBSID"; E = { $_.ID } }, @{ N = "JOBBSNAME"; E = { $_.NAME } }
+		$query = $xml1 | Where-Object { $_.IsScheduleEnabled -eq "true" -and $_.JobType -like "BackupSync" } | Select-Object @{ N = "JOBBSID"; E = { $_.ID | convertto-encoding -switch in } }, @{ N = "JOBBSNAME"; E = { $_.NAME | convertto-encoding -switch in } }
 		$query | ConvertTo-ZabbixDiscoveryJson JOBBSNAME, JOBBSID
 	}
 	
 	"DiscoveryTapeJobs" {
 		$xml1 = ImportXml -item backuptape
-		$query = $xml1 | Select-Object @{ N = "JOBTAPEID"; E = { $_.ID } }, @{ N = "JOBTAPENAME"; E = { $_.NAME } }
+		$query = $xml1 | Select-Object @{ N = "JOBTAPEID"; E = { $_.ID | convertto-encoding -switch in } }, @{ N = "JOBTAPENAME"; E = { $_.NAME | convertto-encoding -switch in } }
 		$query | ConvertTo-ZabbixDiscoveryJson JOBTAPENAME, JOBTAPEID
 	}
 	
 	"DiscoveryEndpointJobs" {
 		$xml1 = ImportXml -item backupendpoint
-		$query = $xml1 | Select-Object Id, Name | Select-Object @{ N = "JOBENDPOINTID"; E = { $_.ID } }, @{ N = "JOBENDPOINTNAME"; E = { $_.NAME } }
+		$query = $xml1 | Select-Object Id, Name | Select-Object @{ N = "JOBENDPOINTID"; E = { $_.ID | convertto-encoding -switch in } }, @{ N = "JOBENDPOINTNAME"; E = { $_.NAME | convertto-encoding -switch in } }
 		$query | ConvertTo-ZabbixDiscoveryJson JOBENDPOINTNAME, JOBENDPOINTID
 	}
 	
 	"DiscoveryReplicaJobs" {
 		$xml1 = ImportXml -item backupjob
-		$query = $xml1 | Where-Object { $_.IsScheduleEnabled -eq "true" -and $_.JobType -like "Replica" } | Select-Object @{ N = "JOBREPLICAID"; E = { $_.ID } }, @{ N = "JOBREPLICANAME"; E = { $_.NAME } }
+		$query = $xml1 | Where-Object { $_.IsScheduleEnabled -eq "true" -and $_.JobType -like "Replica" } | Select-Object @{ N = "JOBREPLICAID"; E = { $_.ID | convertto-encoding -switch in } }, @{ N = "JOBREPLICANAME"; E = { $_.NAME | convertto-encoding -switch in } }
 		$query | ConvertTo-ZabbixDiscoveryJson JOBREPLICANAME, JOBREPLICAID
 	}
 	
 	"DiscoveryRepo" {
-		$query = Get-CimInstance -Class Repository -ComputerName $env:COMPUTERNAME -Namespace ROOT\VeeamBS | Select-Object @{ N = "REPONAME"; E = { $_.NAME } }
+		$query = Get-CimInstance -Class Repository -ComputerName $env:COMPUTERNAME -Namespace ROOT\VeeamBS -ErrorAction SilentlyContinue | Select-Object @{ N = "REPONAME"; E = { $_.NAME | convertto-encoding -switch in } }
 		$query | ConvertTo-ZabbixDiscoveryJson REPONAME
 	}
 	
 	"DiscoveryBackupVmsByJobs" {
 		if ($ID -like "BackupSync")
 		{
-			ImportXml -item backupsyncvmbyjob | Select-Object @{ N = "JOBNAME"; E = { $_.Job } }, @{ N = "JOBVMNAME"; E = { $_.NAME } } | ConvertTo-ZabbixDiscoveryJson JOBVMNAME, JOBNAME
+			ImportXml -item backupsyncvmbyjob | Select-Object @{ N = "JOBNAME"; E = { $_.Job | convertto-encoding -switch in } }, @{ N = "JOBVMNAME"; E = { $_.NAME | convertto-encoding -switch in } } | ConvertTo-ZabbixDiscoveryJson JOBVMNAME, JOBNAME
 		}
 		else
 		{
-			ImportXml -item backupvmbyjob | Select-Object @{ N = "JOBNAME"; E = { $_.Job } }, @{ N = "JOBVMNAME"; E = { $_.NAME } } | ConvertTo-ZabbixDiscoveryJson JOBVMNAME, JOBNAME
+			ImportXml -item backupvmbyjob | Select-Object @{ N = "JOBNAME"; E = { $_.Job | convertto-encoding -switch in } }, @{ N = "JOBVMNAME"; E = { $_.NAME | convertto-encoding -switch in } } | ConvertTo-ZabbixDiscoveryJson JOBVMNAME, JOBNAME
 		}
 	}
 	
@@ -347,18 +1021,19 @@ switch ($ITEM)
 		if ($test -like "False")
 		{
 			$query = New-Item -ItemType Directory -Force -Path "$pathxml"
-		}
-		if ((Get-CimInstance -Class Win32_Process -Filter "Name='PowerShell.EXE'" | Where-Object { $_.CommandLine -Like "*exportxml*" } | Measure-Object).count -eq 1)
-		{
-			$job = ExportXml -command "[Veeam.Backup.Core.CBackupSession]::GetAll()" -name backupsession -switch normal -options true
-			$job0 = ExportXml -command "[Veeam.Backup.Core.CBackupJob]::GetAll()" -name backupjob -switch normal
-			$job1 = ExportXml -command Get-VBRTapeJob -name backuptape -switch normal
-			$job2 = ExportXml -command Get-VBREPJob -name backupendpoint -switch normal
-			$job3 = ExportXml -command "[Veeam.Backup.Core.CBackupJob]::GetAll()" -name backupvmbyjob -switch byvm -type Backup
-			$job4 = ExportXml -command "[Veeam.Backup.Core.CBackupJob]::GetAll()" -name backupsyncvmbyjob -switch byvm -type BackupSync
-			$job5 = ExportXml -name backuptaskswithretry -switch bytaskswithretry
+		}      
+        
+		       
+			$job = ExportXml -command Get-VBRBackupSession -name backupsession -switch normal
+			$job0 = ExportXml -command Get-VBRJob -name backupjob -switch normal
+			$job1 = ExportXml -command Get-VBRBackup -name backupbackup -switch normal
+			$job2 = ExportXml -command Get-VBRTapeJob -name backuptape -switch normal
+			$job3 = ExportXml -command Get-VBREPJob -name backupendpoint -switch normal
+			$job4 = ExportXml -command Get-VBRJob -name backupvmbyjob -switch byvm -type Backup
+			$job5 = ExportXml -command Get-VBRJob -name backupsyncvmbyjob -switch byvm -type BackupSync
+			$job6 = ExportXml -name backuptaskswithretry -switch bytaskswithretry
 			Get-Job | Wait-Job
-		}
+		
 	}
 	
 	"ResultBackup"  {
@@ -372,17 +1047,15 @@ switch ($ITEM)
 		else
 		{
 			$query3 = $query2.value
-			$query4 = "$query3" | VeeamStatusReplace
+			$query4 = "$query3" | veeam-replace
 			write-output "$query4"
 		}
 	}
 	
 	"ResultBackupSync"  {
-		[System.DateTime]$ExcludeDate = (Get-Date).adddays(-7)
 		$xml = ImportXml -item backupjob | Where-Object { $_.Id -like $ID }
-		$result = veeam-backuptask-unique -ID $xml.name -jobtype jobname | Where-Object { $_.JobEnd -ge $ExcludeDate }
-		$result1 = $result | Where-Object { $_.JobEnd -ge $ExcludeDate } # If the Vm have not a backup for 7 days, exclusion
-		$query = $result1 | Measure-Object
+		$result = veeam-backuptask-unique -ID $xml.name -jobtype jobname
+		$query = $result | Measure-Object
 		$count = $query.count
 		$success = ($Result.Status | Where-Object { $_.Value -like "*Success*" }).count
 		$warning = ($Result.Status | Where-Object { $_.Value -like "*Warning*" }).count
@@ -409,7 +1082,7 @@ switch ($ITEM)
 							if (!$query1.Result.Value) { write-output "4" }
 							else
 							{
-								$query2 = $query1.Result.Value | VeeamStatusReplace
+								$query2 = $query1.Result.Value | veeam-replace
 								write-output "$query2"
 							}
 						}
@@ -442,7 +1115,7 @@ switch ($ITEM)
 				{
 					$query = Get-VBRTapeJob | Where-Object { $_.Id -like "*$ID*" }
 					$query1 = $query.GetLastResult()
-					$query2 = "$query1" | VeeamStatusReplace
+					$query2 = "$query1" | veeam-replace
 					write-output "$query2"
 				}
 				else
@@ -458,7 +1131,7 @@ switch ($ITEM)
 				}
 				else
 				{
-					$query3 = $query2 | VeeamStatusReplace
+					$query3 = $query2 | veeam-replace
 					write-output "$query3"
 				}
 			}
@@ -486,7 +1159,7 @@ switch ($ITEM)
 			else
 			{
 				$query4 = $query2.value
-				$query3 = $query4 | VeeamStatusReplace
+				$query3 = $query4 | veeam-replace
 				write-output "$query3"
 			}
 		}
@@ -503,7 +1176,7 @@ switch ($ITEM)
 		else
 		{
 			$query3 = $query2.value
-			$query4 = "$query3" | VeeamStatusReplace
+			$query4 = "$query3" | veeam-replace
 			write-output "$query4"
 		}
 	}
@@ -518,7 +1191,7 @@ switch ($ITEM)
 		else
 		{
 			$query3 = $Result.Status.Value
-			$query4 = $query3 | VeeamStatusReplace
+			$query4 = $query3 | veeam-replace
 			[string]$query4
 		}
 	}
@@ -533,17 +1206,17 @@ switch ($ITEM)
 		else
 		{
 			$query3 = $Result.Status.Value
-			$query4 = $query3 | VeeamStatusReplace
+			$query4 = $query3 | veeam-replace
 			[string]$query4
 		}
 	}
 	"RepoCapacity" {
-		$query = Get-CimInstance -Class Repository -ComputerName $env:COMPUTERNAME -Namespace ROOT\VeeamBS | Where-Object { $_.Name -eq "$ID" }
+		$query = Get-CimInstance -Class Repository -ComputerName $env:COMPUTERNAME -Namespace ROOT\VeeamBS -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "$ID" }
 		$query | Select-Object -ExpandProperty Capacity
 	}
 	
 	"RepoFree" {
-		$query = Get-CimInstance -Class Repository -ComputerName $env:COMPUTERNAME -Namespace ROOT\VeeamBS | Where-Object { $_.Name -eq "$ID" }
+		$query = Get-CimInstance -Class Repository -ComputerName $env:COMPUTERNAME -Namespace ROOT\VeeamBS -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "$ID" }
 		$query | Select-Object -ExpandProperty FreeSpace
 	}
 	
@@ -589,31 +1262,163 @@ switch ($ITEM)
 	}
 	
 	"Type" {
-		$xml1 = ImportXml -item backupsession
-		$query = $xml1 | Where-Object { $_.JobId -like "$ID" } | Select-Object -First 1
-		[string]$query.JobType
+		$xml1 = ImportXml -item backupbackup
+		if (!$xml1) { $xml1 = ImportXml -item backupsession }
+		# Get-VBRBackup objects have JobId nested in Info property, Get-VBRBackupSession has JobId directly
+		if ($xml1 -is [Array]) {
+			$query = $xml1 | Where-Object { 
+				if ($_.Info -and $_.Info.JobId) { 
+					$_.Info.JobId.ToString() -like "$ID" 
+				} else { 
+					$_.JobId -like "$ID" 
+				}
+			} | Select-Object -First 1
+		} else {
+			if ($xml1 -and $xml1.Info -and $xml1.Info.JobId -and $xml1.Info.JobId.ToString() -like "$ID") {
+				$query = $xml1
+			} elseif ($xml1 -and $xml1.JobId -and $xml1.JobId -like "$ID") {
+				$query = $xml1
+			} else {
+				$query = $null
+			}
+		}
+		if ($query) {
+			if ($query.Info -and $query.Info.JobType) {
+				[string]$query.Info.JobType
+			} elseif ($query.JobType) {
+				[string]$query.JobType
+			} else {
+				[string]$query.AttachedJobType
+			}
+		} else {
+			Write-Output ""
+		}
 	}
 	
 	"LastRunTime" {
-		$xml1 = ImportXml -item backupsession
-		$query = $xml1 | Where-Object { $_.JobId -like "*$ID*" } | Sort-Object creationtime -Descending | Select-Object -First 1
-		[string]$query1 = $query.CreationTimeUTC.ToString('dd/MM/yyyy HH:mm:ss')
-		$result1 = $nextdate, $nexttime = $query1.Split(" ")
-		$newdate = ("$($nextdate -replace "(\d{2})-(\d{2})", "`$2-`$1") $nexttime")
-		$date = get-date -date "01/01/1970"
-		$result2 = (New-TimeSpan -Start $date -end $newdate).TotalSeconds
-		[string]$result2
+		# LastRunTime returns the Unix timestamp of when the backup job last completed/finished
+		# This is the EndTime of the most recent completed backup session
+		# Use case in Zabbix: 
+		#   - SLA monitoring: Calculate time since last successful backup
+		#   - Alerting: Trigger if backup hasn't completed in X hours/days
+		#   - Backup frequency tracking: Monitor backup schedule compliance
+		# Use backupsession.xml to get the most recent completed session's EndTime
+		# Do not fallback to backupbackup.xml - better to return 0 than wrong values
+		$xml2 = ImportXml -item backupsession
+		$lastPointTime = $null
+		
+		if ($xml2) {
+			$sessionArray = @($xml2)
+			if ($sessionArray.Count -gt 0) {
+				# Get the most recent completed session sorted by EndTime (when job finished)
+				# Filter for sessions with EndTime (completed sessions) - check for non-null EndTime
+				$sessionQuery = $sessionArray | Where-Object { 
+					$_.JobId -like "*$ID*" -and $null -ne $_.EndTime -and $_.EndTime -ne [DateTime]::MinValue
+				} | Sort-Object EndTime -Descending | Select-Object -First 1
+				# Use EndTime (when job finished) - this is the "Last End Time"
+				if ($sessionQuery -and $sessionQuery.EndTime -and $sessionQuery.EndTime -ne [DateTime]::MinValue) {
+					$lastPointTime = $sessionQuery.EndTime
+				}
+			}
+		}
+		if ($lastPointTime) {
+			# Handle DateTime object or string
+			if ($lastPointTime -is [DateTime]) {
+				$dateTime = $lastPointTime
+			} else {
+				[string]$query1 = $lastPointTime
+				if ([string]::IsNullOrWhiteSpace($query1)) {
+					Write-Output "0"
+					return
+				}
+				$result1 = $nextdate, $nexttime = $query1.Split(" ")
+				if ($result1.Count -ge 2) {
+					$newdateString = "$($nextdate -replace "(\d{2})-(\d{2})", "`$2-`$1") $nexttime"
+					try {
+						$dateTime = [DateTime]::Parse($newdateString)
+					} catch {
+						Write-Output "0"
+						return
+					}
+				} else {
+					Write-Output "0"
+					return
+				}
+			}
+			$epoch = [DateTime]::ParseExact("1970-01-01 00:00:00", "yyyy-MM-dd HH:mm:ss", $null).ToUniversalTime()
+			$result2 = [Math]::Floor((New-TimeSpan -Start $epoch -End $dateTime.ToUniversalTime()).TotalSeconds)
+			# Return as numeric value (not string) and ensure non-negative
+			if ($result2 -lt 0) {
+				Write-Output "0"
+			} else {
+				Write-Output $result2
+			}
+		} else {
+			Write-Output "0"
+		}
 	}
 	
 	"LastEndTime" {
-		$xml1 = ImportXml -item backupsession
-		$query = $xml1 | Where-Object { $_.JobId -like "*$ID*" } | Sort-Object creationtime -Descending | Select-Object -First 1
-		[string]$query1 = $query.EndTime
-		$result1 = $nextdate, $nexttime = $query1.Split(" ")
-		$newdate = [datetime]("$($nextdate -replace "(\d{2})-(\d{2})", "`$2-`$1") $nexttime")
-		$date = get-date -date "01/01/1970"
-		$result2 = (New-TimeSpan -Start $date -end $newdate).TotalSeconds
-		[string]$result2
+		# LastEndTime returns the backup metadata update time (MetaUpdateTime from backupbackup.xml)
+		# This represents when the backup chain metadata was last modified/updated
+		# Use case in Zabbix: Monitor backup chain activity and metadata freshness
+		# Note: This is different from LastRunTime - LastEndTime tracks metadata updates,
+		#       while LastRunTime tracks actual job completion times
+		$xml1 = ImportXml -item backupbackup
+		if (!$xml1) {
+			Write-Output "0"
+			return
+		}
+		# Get-VBRBackup objects have JobId nested in Info property
+		# Handle both array and single object cases
+		$query = $null
+		if ($xml1 -is [Array]) {
+			$query = $xml1 | Where-Object { 
+				if ($_.Info -and $_.Info.JobId) { 
+					$_.Info.JobId.ToString() -like "*$ID*" 
+				}
+			} | Select-Object -First 1
+		} else {
+			if ($xml1.Info -and $xml1.Info.JobId -and $xml1.Info.JobId.ToString() -like "*$ID*") {
+				$query = $xml1
+			}
+		}
+		if ($query -and $query.Info -and $query.Info.MetaUpdateTime) {
+			$metaUpdateTime = $query.Info.MetaUpdateTime
+			# Handle DateTime object or string
+			if ($metaUpdateTime -is [DateTime]) {
+				$dateTime = $metaUpdateTime
+			} else {
+				[string]$query1 = $metaUpdateTime
+				if ([string]::IsNullOrWhiteSpace($query1)) {
+					Write-Output "0"
+					return
+				}
+				$result1 = $nextdate, $nexttime = $query1.Split(" ")
+				if ($result1.Count -ge 2) {
+					$newdateString = "$($nextdate -replace "(\d{2})-(\d{2})", "`$2-`$1") $nexttime"
+					try {
+						$dateTime = [DateTime]::Parse($newdateString)
+					} catch {
+						Write-Output "0"
+						return
+					}
+				} else {
+					Write-Output "0"
+					return
+				}
+			}
+			$epoch = [DateTime]::ParseExact("1970-01-01 00:00:00", "yyyy-MM-dd HH:mm:ss", $null).ToUniversalTime()
+			$result2 = [Math]::Floor((New-TimeSpan -Start $epoch -End $dateTime.ToUniversalTime()).TotalSeconds)
+			# Return as numeric value (not string) and ensure non-negative
+			if ($result2 -lt 0) {
+				Write-Output "0"
+			} else {
+				Write-Output $result2
+			}
+		} else {
+			Write-Output "0"
+		}
 	}
 	
 	"NextRunTime" {
@@ -635,7 +1440,7 @@ switch ($ITEM)
 	
 	"RunningJob" {
 		$xml1 = ImportXml -item backupjob
-		$query = $xml1 | Where-Object { $_.IsRunning -eq $true } | Measure-Object
+		$query = $xml1 | Where-Object { $_.isCompleted -eq $false } | Measure-Object
 		if ($query)
 		{
 			[string]$query.Count
