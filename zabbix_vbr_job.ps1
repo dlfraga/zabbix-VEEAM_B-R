@@ -687,47 +687,65 @@ function ExportXml
 			# Get cached module path (performance optimization)
 			$moduleInfo = Get-VeeamModulePath
 			
-			# Phase 2 optimization: Replace Invoke-Expression with direct cmdlet calls
-			# Map command strings to script blocks for better performance
-			$cmdletMap = @{
-				"Get-VBRBackupSession" = { Get-VBRBackupSession }
-				"Get-VBRJob" = { Get-VBRJob }
-				"Get-VBRBackup" = { Get-VBRBackup }
-				"Get-VBRTapeJob" = { Get-VBRTapeJob }
-				"Get-VBREPJob" = { Get-VBREPJob }
-			}
-			
-			$cmdletScriptBlock = $null
-			if ($cmdletMap.ContainsKey($command)) {
-				$cmdletScriptBlock = $cmdletMap[$command]
-			}
-			
 			Start-Job -Name $name -ScriptBlock {
-				# Suppress warnings and errors
-				$ErrorActionPreference = 'SilentlyContinue'
+				# Suppress warnings but allow errors to be captured
 				$WarningPreference = 'SilentlyContinue'
+				$ErrorActionPreference = 'Stop'
 				
-				# Load Veeam PowerShell module or snapin using cached path
-				$moduleLoaded = $false
-				if ($args[4].Type -eq "Module") {
-					if ($args[4].Path -eq "Veeam.Backup.PowerShell") {
-						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+				try {
+					# Load Veeam PowerShell module or snapin using cached path
+					$moduleLoaded = $false
+					if ($args[4].Type -eq "Module") {
+						if ($args[4].Path -eq "Veeam.Backup.PowerShell") {
+							Import-Module Veeam.Backup.PowerShell -ErrorAction Stop -WarningAction SilentlyContinue
+						} else {
+							Import-Module $args[4].Path -ErrorAction Stop -WarningAction SilentlyContinue
+						}
+						if (Get-Module -Name Veeam.Backup.PowerShell) {
+							$moduleLoaded = $true
+						} else {
+							throw "Failed to load Veeam PowerShell module"
+						}
 					} else {
-						Import-Module $args[4].Path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-					}
-					if (Get-Module -Name Veeam.Backup.PowerShell) {
+						Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction Stop
 						$moduleLoaded = $true
 					}
-				} else {
-					Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
-					$moduleLoaded = $true
+					
+					if (-not $moduleLoaded) {
+						throw "Veeam PowerShell module/snapin was not loaded"
+					}
+					
+					$connectVeeam = Connect-VBRServer
+					if ($null -eq $connectVeeam) {
+						# Test connection by trying a cmdlet
+						$testConnection = Get-VBRJob -ErrorAction Stop | Select-Object -First 1
+					}
+					
+					# Execute command based on command string (avoid script block serialization issues)
+					# Use direct cmdlet calls for better performance and reliability
+					$result = switch ($args[0]) {
+						"Get-VBRBackupSession" { Get-VBRBackupSession }
+						"Get-VBRJob" { Get-VBRJob }
+						"Get-VBRBackup" { Get-VBRBackup }
+						"Get-VBRTapeJob" { Get-VBRTapeJob }
+						"Get-VBREPJob" { Get-VBREPJob }
+						default { throw "Unknown command: $($args[0])" }
+					}
+					
+					if ($null -eq $result) {
+						# Empty result is OK for some cmdlets (e.g., Get-VBRTapeJob if no tape jobs exist)
+						# Create empty array to ensure XML file is created
+						$result = @()
+					}
+					
+					$result | Export-Clixml $args[1] -ErrorAction Stop
+					$disconnectVeeam = Disconnect-VBRServer
+				} catch {
+					# Write error to output so it can be captured by Receive-Job
+					Write-Error "Job '$($args[2])' failed: $($_.Exception.Message)" -ErrorAction Continue
+					throw
 				}
-				
-				$connectVeeam = Connect-VBRServer
-				# Phase 3 optimization: Use direct script block execution (no fallback needed - all commands mapped)
-				& $args[5] | Export-Clixml $args[1]
-				$disconnectVeeam = Disconnect-VBRServer
-			} -ArgumentList "$command", "$newpath", "$name", "$newpath", $moduleInfo, $cmdletScriptBlock
+			} -ArgumentList "$command", "$newpath", "$name", "$newpath", $moduleInfo
 		}
 		
 		
@@ -1091,6 +1109,57 @@ switch ($ITEM)
 		# Phase 3 optimization: Wait for jobs with timeout and efficient cleanup
 		$jobs = Get-Job
 		$jobs | Wait-Job -Timeout 600 | Out-Null
+		
+		# Check job status and report any failures
+		$failedJobs = Get-Job | Where-Object { $_.State -eq 'Failed' }
+		$runningJobs = Get-Job | Where-Object { $_.State -eq 'Running' }
+		
+		if ($failedJobs) {
+			foreach ($job in $failedJobs) {
+				$errorOutput = $job | Receive-Job -ErrorAction SilentlyContinue -ErrorVariable jobErrors 2>&1
+				Write-Error "Job '$($job.Name)' (ID: $($job.Id)) FAILED. Error: $($jobErrors.Exception.Message)"
+			}
+		}
+		
+		if ($runningJobs) {
+			foreach ($job in $runningJobs) {
+				Write-Warning "Job '$($job.Name)' (ID: $($job.Id)) is still RUNNING after timeout - may not have completed successfully"
+			}
+		}
+		
+		# Verify XML files were created/updated
+		$expectedFiles = @(
+			@{ Name = "backupsession"; Job = "backupsession" },
+			@{ Name = "backupjob"; Job = "backupjob" },
+			@{ Name = "backupbackup"; Job = "backupbackup" },
+			@{ Name = "backuptape"; Job = "backuptape" },
+			@{ Name = "backupendpoint"; Job = "backupendpoint" },
+			@{ Name = "backupvmbyjob"; Job = "backupvmbyjob" },
+			@{ Name = "backupsyncvmbyjob"; Job = "backupsyncvmbyjob" },
+			@{ Name = "backuptaskswithretry"; Job = "backuptaskswithretry" }
+		)
+		
+		$beforeTime = Get-Date
+		$missingFiles = @()
+		foreach ($file in $expectedFiles) {
+			$filePath = Join-Path $pathxml "$($file.Name).xml"
+			if (-not (Test-Path $filePath)) {
+				$missingFiles += $file.Name
+				Write-Warning "XML file '$($file.Name).xml' was not created"
+			} else {
+				$fileInfo = Get-Item $filePath
+				# Check if file was updated in the last 2 minutes (should be recent)
+				$timeSinceUpdate = (Get-Date) - $fileInfo.LastWriteTime
+				if ($timeSinceUpdate.TotalMinutes -gt 2) {
+					Write-Warning "XML file '$($file.Name).xml' was not updated in this run (last updated: $($fileInfo.LastWriteTime))"
+				}
+			}
+		}
+		
+		if ($missingFiles.Count -gt 0) {
+			Write-Error "The following XML files were not created: $($missingFiles -join ', ')"
+		}
+		
 		# Phase 3: Clean up all jobs (completed and failed) in single operation
 		Get-Job | Remove-Job -ErrorAction SilentlyContinue
 		
