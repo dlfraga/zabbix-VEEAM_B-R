@@ -674,7 +674,9 @@ function ExportXml
 		[Parameter(Mandatory = $false)]
 		[string]$command,
 		[Parameter(Mandatory = $false)]
-		[string]$type
+		[string]$type,
+		[Parameter(Mandatory = $false)]
+		[hashtable]$moduleInfoOverride = $null
 	)
 	
 	PROCESS
@@ -685,7 +687,13 @@ function ExportXml
 		if ($switch -like "normal")
 		{
 			# Get cached module path (performance optimization)
-			$moduleInfo = Get-VeeamModulePath
+			# Use override if provided (for nowait mode to skip discovery)
+			# For nowait mode, moduleInfoOverride will have Path=$null, but we still use it to skip Get-VeeamModulePath
+			if ($null -ne $moduleInfoOverride) {
+				$moduleInfo = $moduleInfoOverride
+			} else {
+				$moduleInfo = Get-VeeamModulePath
+			}
 			
 			Start-Job -Name $name -ScriptBlock {
 				# Suppress warnings but allow errors to be captured
@@ -693,9 +701,38 @@ function ExportXml
 				$ErrorActionPreference = 'Stop'
 				
 				try {
-					# Load Veeam PowerShell module or snapin using cached path
+					# Load Veeam PowerShell module or snapin
+					# If moduleInfo is null/empty (nowait mode), discover module path ourselves
 					$moduleLoaded = $false
-					if ($args[4].Type -eq "Module") {
+					if ($null -eq $args[4] -or $null -eq $args[4].Type -or [string]::IsNullOrEmpty($args[4].Path)) {
+						# No moduleInfo provided - discover it ourselves (nowait mode)
+						if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+							Import-Module Veeam.Backup.PowerShell -ErrorAction Stop -WarningAction SilentlyContinue
+							if (Get-Module -Name Veeam.Backup.PowerShell) {
+								$moduleLoaded = $true
+							}
+						} else {
+							# Try common paths
+							$possiblePaths = @(
+								"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
+								"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
+							)
+							foreach ($path in $possiblePaths) {
+								if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
+									Import-Module $path -ErrorAction Stop -WarningAction SilentlyContinue
+									if (Get-Module -Name Veeam.Backup.PowerShell) {
+										$moduleLoaded = $true
+										break
+									}
+								}
+							}
+							if (-not $moduleLoaded) {
+								Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction Stop
+								$moduleLoaded = $true
+							}
+						}
+					} elseif ($args[4].Type -eq "Module") {
+						# Use provided moduleInfo
 						if ($args[4].Path -eq "Veeam.Backup.PowerShell") {
 							Import-Module Veeam.Backup.PowerShell -ErrorAction Stop -WarningAction SilentlyContinue
 						} else {
@@ -752,7 +789,13 @@ function ExportXml
 		if ($switch -like "byvm")
 		{
 			# Get cached module path (performance optimization)
-			$moduleInfo = Get-VeeamModulePath
+			# Use override if provided (for nowait mode to skip discovery)
+			# For nowait mode, moduleInfoOverride will have Path=$null, but we still use it to skip Get-VeeamModulePath
+			if ($null -ne $moduleInfoOverride) {
+				$moduleInfo = $moduleInfoOverride
+			} else {
+				$moduleInfo = Get-VeeamModulePath
+			}
 			
 			# Phase 2 optimization: Create optimized script blocks instead of string commands
 			if ($type -eq "BackupSync") {
@@ -779,8 +822,36 @@ function ExportXml
 				$WarningPreference = 'SilentlyContinue'
 				
 				# Load Veeam PowerShell module or snapin using cached path
+				# Handle null/empty moduleInfo (nowait mode)
 				$moduleLoaded = $false
-				if ($args[4].Type -eq "Module") {
+				if ($null -eq $args[4] -or $null -eq $args[4].Type -or [string]::IsNullOrEmpty($args[4].Path)) {
+					# No moduleInfo provided - discover it ourselves (nowait mode)
+					if (Get-Module -ListAvailable -Name Veeam.Backup.PowerShell) {
+						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+						if (Get-Module -Name Veeam.Backup.PowerShell) {
+							$moduleLoaded = $true
+						}
+					} else {
+						# Try common paths
+						$possiblePaths = @(
+							"C:\Program Files\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell",
+							"C:\Program Files (x86)\Veeam\Backup and Replication\Backup\BackupClient\Veeam.Backup.PowerShell"
+						)
+						foreach ($path in $possiblePaths) {
+							if (Test-Path (Join-Path $path "Veeam.Backup.PowerShell.psd1")) {
+								Import-Module $path -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+								if (Get-Module -Name Veeam.Backup.PowerShell) {
+									$moduleLoaded = $true
+									break
+								}
+							}
+						}
+						if (-not $moduleLoaded) {
+							Add-PSSnapin -Name VeeamPSSnapIn -ErrorAction SilentlyContinue
+							$moduleLoaded = $true
+						}
+					}
+				} elseif ($args[4].Type -eq "Module") {
 					if ($args[4].Path -eq "Veeam.Backup.PowerShell") {
 						Import-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
 					} else {
@@ -812,7 +883,13 @@ function ExportXml
 		if ($switch -like "bytaskswithretry")
 		{
 			# Get cached module path (performance optimization)
-			$moduleInfo = Get-VeeamModulePath
+			# Use override if provided (for nowait mode to skip discovery)
+			# For nowait mode, moduleInfoOverride will have Path=$null, but we still use it to skip Get-VeeamModulePath
+			if ($null -ne $moduleInfoOverride) {
+				$moduleInfo = $moduleInfoOverride
+			} else {
+				$moduleInfo = Get-VeeamModulePath
+			}
 			
 			Start-Job -Name $name -ScriptBlock {
 				# Suppress warnings and errors
@@ -1036,8 +1113,15 @@ if ([string]::IsNullOrWhiteSpace($ITEM)) {
 	}
 }
 
+# Check if this is ExportXml with nowait - if so, skip module loading for faster return
+# Module will be loaded by background jobs themselves
+$isExportXmlNowait = ($ITEM -like "ExportXml" -or $ITEM -like "exportxml") -and $args.Count -gt 1 -and [string]$args[1] -like "nowait"
+
 # Load Veeam Module (try Veeam 13+ module first, then fall back to Veeam 12 snapin)
-Load-VeeamPowerShell
+# Skip for ExportXml with nowait to return faster
+if (-not $isExportXmlNowait) {
+	Load-VeeamPowerShell
+}
 
 switch ($ITEM)
 {
@@ -1089,23 +1173,53 @@ switch ($ITEM)
 	
 	"ExportXml" {
 		
+		# Check if "nowait" parameter is provided FIRST (before any heavy operations)
+		# This allows immediate return for Zabbix agent timeout requirements
+		$nowait = $false
+		if ($args.Count -gt 1 -and [string]$args[1] -like "nowait") {
+			$nowait = $true
+		}
+		
+		# For nowait mode: Use the ExportXml launcher script to launch in background
+		# This allows immediate return to Zabbix agent while work continues in background
+		if ($nowait) {
+			# Get the script directory
+			$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+			$exportXmlScript = Join-Path $scriptDir "zabbix_vbr_exportxml.ps1"
+			
+			# Verify ExportXml launcher script exists
+			if (-not (Test-Path $exportXmlScript)) {
+				Write-Error "ExportXml launcher script not found: $exportXmlScript"
+				exit 1
+			}
+			
+			# Call the ExportXml launcher script - it will handle launching the exportxml work in background
+			# and return immediately
+			& $exportXmlScript
+			return
+		}
+		
 		$test = Test-Path -Path "$pathxml"
 		if ($test -like "False")
 		{
 			$query = New-Item -ItemType Directory -Force -Path "$pathxml"
 		}
 		
-		# Pre-discover and cache module path for all background jobs (performance optimization)
-		$null = Get-VeeamModulePath
-		       
-		$job = ExportXml -command Get-VBRBackupSession -name backupsession -switch normal
-		$job0 = ExportXml -command Get-VBRJob -name backupjob -switch normal
-		$job1 = ExportXml -command Get-VBRBackup -name backupbackup -switch normal
-		$job2 = ExportXml -command Get-VBRTapeJob -name backuptape -switch normal
-		$job3 = ExportXml -command Get-VBREPJob -name backupendpoint -switch normal
-		$job4 = ExportXml -command Get-VBRJob -name backupvmbyjob -switch byvm -type Backup
-		$job5 = ExportXml -command Get-VBRJob -name backupsyncvmbyjob -switch byvm -type BackupSync
-		$job6 = ExportXml -name backuptaskswithretry -switch bytaskswithretry
+		# Pre-discover and cache module path ONCE for all background jobs (performance optimization)
+		# For blocking mode, discover once and cache for all jobs
+		$sharedModuleInfo = Get-VeeamModulePath
+		
+		# For blocking mode, start jobs normally (sequential but that's OK since we wait anyway)
+		$job = ExportXml -command Get-VBRBackupSession -name backupsession -switch normal -moduleInfoOverride $sharedModuleInfo
+		$job0 = ExportXml -command Get-VBRJob -name backupjob -switch normal -moduleInfoOverride $sharedModuleInfo
+		$job1 = ExportXml -command Get-VBRBackup -name backupbackup -switch normal -moduleInfoOverride $sharedModuleInfo
+		$job2 = ExportXml -command Get-VBRTapeJob -name backuptape -switch normal -moduleInfoOverride $sharedModuleInfo
+		$job3 = ExportXml -command Get-VBREPJob -name backupendpoint -switch normal -moduleInfoOverride $sharedModuleInfo
+		$job4 = ExportXml -command Get-VBRJob -name backupvmbyjob -switch byvm -type Backup -moduleInfoOverride $sharedModuleInfo
+		$job5 = ExportXml -command Get-VBRJob -name backupsyncvmbyjob -switch byvm -type BackupSync -moduleInfoOverride $sharedModuleInfo
+		$job6 = ExportXml -name backuptaskswithretry -switch bytaskswithretry -moduleInfoOverride $sharedModuleInfo
+		
+		# Blocking mode: Wait for all jobs to complete (original behavior)
 		# Phase 3 optimization: Wait for jobs with timeout and efficient cleanup
 		$jobs = Get-Job
 		$jobs | Wait-Job -Timeout 600 | Out-Null
@@ -1163,6 +1277,8 @@ switch ($ITEM)
 		# Phase 3: Clean up all jobs (completed and failed) in single operation
 		Get-Job | Remove-Job -ErrorAction SilentlyContinue
 		
+		# Output 1 to indicate success (Zabbix expects a return value)
+		Write-Output "1"
 	}
 	
 	"ResultBackup"  {
