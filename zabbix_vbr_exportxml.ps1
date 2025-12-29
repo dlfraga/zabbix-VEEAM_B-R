@@ -23,13 +23,14 @@ if (-not (Test-Path $mainScript)) {
 # Start the main script in a background process using Start-Process
 # Use -WindowStyle Hidden to run in background, but don't wait for it
 # The main script will handle starting all the ExportXml jobs
+# NOTE: Call with just "exportxml" (without "nowait") so the background process
+# actually does the work instead of calling this launcher script again
 $process = Start-Process -FilePath "pwsh.exe" `
     -ArgumentList @(
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
         "-File", "`"$mainScript`"",
-        "exportxml",
-        "nowait"
+        "exportxml"
     ) `
     -WindowStyle Hidden `
     -PassThru `
@@ -47,4 +48,5 @@ Write-Output "1"
 
 # Exit immediately - don't wait for the process or jobs
 exit 0
+
 
